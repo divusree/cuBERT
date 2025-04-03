@@ -1,1 +1,4 @@
 *.ipynb
+runs/
+__pycache__
+*.pt
