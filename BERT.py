@@ -147,21 +147,13 @@ class BERTBase(torch.nn.Module):
         h = self.tok_embeddings(tokens)
         attn_mask = attn_mask.unsqueeze(1).unsqueeze(1)
         attn_mask = attn_mask.expand(-1, self.args.n_heads, -1, seq_len)  
-        # if attn_mask is not None:
-        #     h = h * attn_mask.unsqueeze(-1)  # Zero out padding embeddings
-        
         # pos encoding shape - [seq_len, dim]
         pos_encodings = self.pos_encoding[:seq_len] 
-
         h = h + pos_encodings.unsqueeze(0) # figure this out
         # perform forward through all layers
         for layer in self.layers:
             h = layer(h, attn_mask )
-            # if attn_mask is not None:
-            #     h = h * attn_mask.unsqueeze(-1)  # Re-zero padding after each layer
-                    
         h = self.dropout(h)
-
         return h # i will apply softmax outside
     
 class BERTForNER(BERTBase):  # Inherit from your BERTBase
@@ -170,13 +162,8 @@ class BERTForNER(BERTBase):  # Inherit from your BERTBase
         self.ner_head = nn.Linear(args.dim, num_ner_labels) 
         
     def forward(self, tokens: torch.Tensor, attn_mask : torch.Tensor):
-      
-        h = super().forward(tokens, attn_mask = attn_mask )  # Shape: [batch_size, seq_len, dim]
-        
-        logits = self.ner_head(h)  # Shape: [batch_size, seq_len, num_ner_labels]
-        # if attn_mask is not None:
-        #     logits = logits * attn_mask.unsqueeze(-1)  # Force zero outputs for padding
-                    
+        h = super().forward(tokens, attn_mask = attn_mask )  # Shape: [batch_size, seq_len, dim] 
+        logits = self.ner_head(h)  # Shape: [batch_size, seq_len, num_ner_labels]   
         return logits    
  
     
