@@ -256,17 +256,18 @@ def matmul3D(x: torch.Tensor, y: torch.Tensor, xtrans = False, ytrans = False):
     else:
         raise NotImplementedError("x.T @ y.T is not implemented")
     assert x.is_cuda and y.is_cuda and output.is_cuda
-
+    BLOCK_SIZE_M = 64 # min(max(16, M), 64)
+    BLOCK_SIZE_N = 64 # min(max(16, N), 64)
+    BLOCK_SIZE_K = 32  # Keep K block size smaller for register pressure
     grid = lambda meta: (B, triton.cdiv(M, meta['BLOCK_SIZE_M'])*triton.cdiv(N, meta['BLOCK_SIZE_N']))
     matmul3D_kernel[grid](x, y, output, 
                         B, M, K, N, 
                         stride_xb, stride_xm, stride_xk,
                         stride_yb, stride_yk, stride_yn,
                         *output.stride(),
-                        BLOCK_SIZE_B = 1, BLOCK_SIZE_M = 32, BLOCK_SIZE_N = 32, BLOCK_SIZE_K = 32, GROUP_SIZE_M = 8
+                        BLOCK_SIZE_B = 1, BLOCK_SIZE_M = BLOCK_SIZE_M, BLOCK_SIZE_N = BLOCK_SIZE_N, BLOCK_SIZE_K = BLOCK_SIZE_K, GROUP_SIZE_M = 8
                         )
     return output
-
 def matmul(x,y, xtrans = False, ytrans = False):
     if (len(x.shape) == 3) and (len(y.shape) == 3):
         return matmul3D(x, y, xtrans, ytrans)
