@@ -146,8 +146,8 @@ def matmul4D(x: torch.Tensor, y: torch.Tensor, xtrans = False, ytrans = False):
     assert (B == B1) and (H == H1)
     # Allocate output
     output = torch.empty((B, H, M, N), device='cuda', dtype=y.dtype)
-    BLOCK_SIZE_M = 64 if M >= 64 else M
-    BLOCK_SIZE_N = 64 if N >= 64 else N
+    BLOCK_SIZE_M = 64 if M >= 64 else triton.next_power_of_2(M)
+    BLOCK_SIZE_N = 64 if N >= 64 else triton.next_power_of_2(N)
     BLOCK_SIZE_K = 32  # Keep K block size smaller for register pressure
     
     stride_xb,stride_xh, stride_xm, stride_xk = x.stride()
@@ -399,22 +399,19 @@ def softmax4D(x: torch.Tensor):
 
 @triton.jit
 def batched_layer_norm_kernel(x_ptr,output_ptr, eps,
-                B, H, M, N: tl.constexpr,
-                stride_xb, stride_xh, stride_xm, stride_xn,
+                B, M, N: tl.constexpr,
+                stride_xb,  stride_xm, stride_xn,
                 mean_ptr, var_ptr,
-                stride_mb, stride_mh, stride_mm, stride_mn,
+                stride_mb,  stride_mm, stride_mn,
 
                 BLOCK_SIZE_M: tl.constexpr,
                 BLOCK_SIZE_N: tl.constexpr,
                 ):
 
-    pid_batch = tl.program_id(axis=0) 
+    pid_b = tl.program_id(axis=0) 
     pid_m = tl.program_id(axis=1)
 
-    pid_b = pid_batch // H
-    pid_h = pid_batch % H
-
-    offset = pid_b * stride_xb + pid_h * stride_xh + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))[:,None] * stride_xm +  tl.arange(0, BLOCK_SIZE_N)[None,:]*stride_xn
+    offset = pid_b * stride_xb + (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))[:,None] * stride_xm +  tl.arange(0, BLOCK_SIZE_N)[None,:]*stride_xn
     x_ptr += offset
     mean = tl.zeros((BLOCK_SIZE_M, 1), dtype = tl.float32 )
     for n in range (0, tl.cdiv(N, BLOCK_SIZE_N)):
@@ -422,7 +419,7 @@ def batched_layer_norm_kernel(x_ptr,output_ptr, eps,
         x = tl.load(x_ptr + offset_col , mask = offset_col < N, other = 0.0)   
         mean += tl.sum(x, axis = -1, keep_dims = True) 
     mean = tl.sum(mean, axis = -1, keep_dims = True) /N
-    tl.store(mean_ptr + pid_b * stride_mb + pid_h * stride_mh +  (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))[:,None] * stride_mm , mean)
+    tl.store(mean_ptr + pid_b * stride_mb +  (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))[:,None] * stride_mm , mean)
 
     variance = tl.zeros((BLOCK_SIZE_M, 1), dtype = tl.float32 )
     for n in range (0, tl.cdiv(N, BLOCK_SIZE_N)):
@@ -432,7 +429,7 @@ def batched_layer_norm_kernel(x_ptr,output_ptr, eps,
 
     variance = tl.sum(variance, axis = -1, keep_dims = True) /N
     rstd = 1/tl.sqrt(variance + eps)
-    tl.store(var_ptr + pid_b * stride_mb + pid_h * stride_mh +  (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))[:,None] * stride_mm, variance)
+    tl.store(var_ptr + pid_b * stride_mb +  (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M))[:,None] * stride_mm, variance)
 
     output_ptr += offset
     for n in range (0, tl.cdiv(N, BLOCK_SIZE_N)):
@@ -441,16 +438,16 @@ def batched_layer_norm_kernel(x_ptr,output_ptr, eps,
         output = (x - mean) * rstd        
         tl.store(output_ptr  + offset_col ,  output, mask = offset_col < N)
 
-def layer_norm4D(x: torch.Tensor):
-    B, H, M , N = x.shape
+def layer_norm(x: torch.Tensor, eps = 1e-6):
+    B, M , N = x.shape
     output = torch.zeros_like(x,  device = x.device, dtype = x.dtype)
     assert x.is_cuda and output.is_cuda
-    eps = 1e-6
-    mean = torch.zeros((B, H, M, 1), device = x.device, dtype = x.dtype)
-    var = torch.zeros((B, H, M, 1), device = x.device, dtype = x.dtype)
-    grid = lambda meta: (B * H, triton.cdiv(M, meta['BLOCK_SIZE_M']))
+    
+    mean = torch.zeros((B, M, 1), device = x.device, dtype = x.dtype)
+    var = torch.zeros((B, M, 1), device = x.device, dtype = x.dtype)
+    grid = lambda meta: (B, triton.cdiv(M, meta['BLOCK_SIZE_M']))
     batched_layer_norm_kernel[grid](x, output, eps,
-                    B, H, M , N,
+                    B, M , N,
                     *x.stride(),
                     mean, var, *mean.stride(),
                     BLOCK_SIZE_M = 32, 
