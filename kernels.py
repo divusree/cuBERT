@@ -356,7 +356,7 @@ def fa_fwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, attn_mask: torch.T
     return output, L
 
 @triton.jit
-def fa_bwd_inner_kernel(q_ptr, k_ptr, v_ptr,
+def fa_bwd_kernel(q_ptr, k_ptr, v_ptr,
                         o_ptr, dO_ptr, L_ptr, qk_scale,
                         dQ_ptr, dK_ptr, dV_ptr, D_ptr, 
                         B: tl.constexpr , H: tl.constexpr, M: tl.constexpr , N: tl.constexpr, 
@@ -369,12 +369,12 @@ def fa_bwd_inner_kernel(q_ptr, k_ptr, v_ptr,
 
     pid_batch = tl.program_id(axis=0) 
     pid_row = tl.program_id(axis = 1)
-    pid_col = 0
+    pid_col = tl.program_id(axis = 2)
 
     pid_b = pid_batch // H
     pid_h = pid_batch % H
 
-    offset_kv_row_block = (pid_row * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offset_kv_row_block = (pid_row * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % BLOCK_SIZE_M
     offset_kv_col_block = (pid_col * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % BLOCK_SIZE_N # check the modulo
 
     offset =  pid_b * stride_qb + pid_h * stride_qh + offset_kv_row_block[:,None] * stride_qm + offset_kv_col_block[None,:] *stride_qn
@@ -384,15 +384,16 @@ def fa_bwd_inner_kernel(q_ptr, k_ptr, v_ptr,
     K_j = tl.load(k_ptr, mask = kv_mask, other = 0)
     V_j = tl.load(v_ptr, mask = kv_mask, other = 0)
 
-    offset_row_block =  tl.arange(0, BLOCK_SIZE_M)% M
+    offset_row_block =  tl.arange(0, BLOCK_SIZE_M) % BLOCK_SIZE_M
     offset_col_block = tl.arange(0, BLOCK_SIZE_N) % BLOCK_SIZE_N # check the modulo
 
-    q_ptr += pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
-    o_ptr += pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
-    dO_ptr += pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
-    dQ_ptr += pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
+    q_offset = pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
+    q_ptr += q_offset
+    o_ptr += q_offset
+    dO_ptr += q_offset
+    dQ_ptr += q_offset
+    dQ_offset = q_offset
     q_mask  = (offset_row_block[:,None] < M) & (offset_col_block[None, :] < N)
-    dQ_offset = pid_b * stride_qb + pid_h * stride_qh +  offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
 
     L_ptr += pid_b * stride_lb + pid_h * stride_lh + offset_row_block[:,None] * stride_lm 
     D_ptr += pid_b * stride_lb + pid_h * stride_lh + offset_row_block[:,None] * stride_lm 
@@ -454,16 +455,16 @@ def fa_bwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
     D = O * dO # optimize?
     D = D.sum(dim = -1).reshape(B, H, M, 1)
 
-    grid = lambda meta: (B*H, triton.cdiv(M, meta['BLOCK_SIZE_M']), 1)
-    fa_bwd_inner_kernel[grid](
+    grid = lambda meta: (B*H, triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(N, meta['BLOCK_SIZE_N']))
+    fa_bwd_kernel[grid](
                             Q, K, V, 
                             O, dO, L, qk_scale,
                             dQ, dK, dV, D,
                             B, H, M, N,
                             *Q.stride(), 
                             *L.stride(), 
-                            BLOCK_SIZE_M = 16,
-                            BLOCK_SIZE_N = triton.next_power_of_2(N))   
+                            BLOCK_SIZE_M = max(16, triton.next_power_of_2(M)),
+                            BLOCK_SIZE_N = max(16, triton.next_power_of_2(N)))   
   
     return dQ, dK, dV
 
