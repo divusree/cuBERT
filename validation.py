@@ -1,7 +1,7 @@
 
 import torch
-from autograd import TritonLinearFn, TritonLayerNormFn
-
+from autograd import TritonLinearFn, TritonLayerNormFn, TritonFlashAttnFn
+import math
 
 class TorchOps:
     def torch_matmul(self, x, weight, b = None):
@@ -16,7 +16,19 @@ class TorchOps:
         # Activate module
         op = gamma * norm(x) + beta  
         return op
+    def flash_attention(self, hq, hk, hv, attn_mask = None):
+        qk_scale = 1 / math.sqrt(hq.shape[-1])
+        O = hq @ hk.transpose(-1, -2) # [batch_size, n_heads, seq_len, seq_len]
+        O = O * qk_scale
 
+        if attn_mask is not None:
+            O = O.masked_fill(attn_mask == 0, float('-inf'))
+
+        # matmul: [batch_size, n_heads, seq_len, seq_len] @  [batch_size, n_heads, seq_len, head_dim]
+        # attn_scores = [batch_size, n_heads, seq_len, head_dim]
+        O  =  torch.softmax(O, dim = -1)  @ hv 
+        return O
+    
 class Validator:
     def __init__(self):
         self.torch_operators = TorchOps()
@@ -30,12 +42,13 @@ class Validator:
             ]
             
             # Synthetic gradient (match output shape)
-            with torch.no_grad():
-                dummy_out = torch_op(*inputs)
-                dO = torch.randn_like(dummy_out, device = 'cuda')
+            # with torch.no_grad():
+            #     dummy_out = torch_op(*inputs)
+            #     dO = torch.randn_like(dummy_out, device = 'cuda')
             
             # PyTorch reference
             torch_out = torch_op(*inputs)
+            dO = torch.randn_like(torch_out, device = 'cuda', requires_grad = False)
             torch_out.backward(dO, retain_graph=True)
             torch_grads = [t.grad.clone() for t in inputs]
             
@@ -109,3 +122,14 @@ class Validator:
             atol=1e-3,
             rtol=1e-2
         )              
+    def check_flash_attention(self):
+        B, H, M, N = 4, 4, 32, 32
+        self.validate_gradients(
+            torch_op= self.torch_operators.flash_attention,
+            triton_op= TritonFlashAttnFn.apply,
+            input_shapes=[(B, H, M, N), (B, H, M, N), (B, H, M, N)],  # Shapes for x, weight, bias
+            dtype=torch.float32,
+            atol=1e-3,
+            rtol=1e-2
+        )           
+        
