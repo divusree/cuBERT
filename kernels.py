@@ -359,6 +359,7 @@ def fa_fwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, attn_mask: torch.T
 def fa_bwd_kernel(q_ptr, k_ptr, v_ptr,
                         o_ptr, dO_ptr, L_ptr, qk_scale,
                         dQ_ptr, dK_ptr, dV_ptr, D_ptr, 
+                        
                         B: tl.constexpr , H: tl.constexpr, M: tl.constexpr , N: tl.constexpr, 
                         stride_qb, stride_qh, stride_qm, stride_qn, # all of the matrices have the same stride
                         stride_lb, stride_lh, stride_lm, stride_ln, 
@@ -369,13 +370,13 @@ def fa_bwd_kernel(q_ptr, k_ptr, v_ptr,
 
     pid_batch = tl.program_id(axis=0) 
     pid_row = tl.program_id(axis = 1)
-    pid_col = tl.program_id(axis = 2)
+    pid_col = 0
 
     pid_b = pid_batch // H
     pid_h = pid_batch % H
 
-    offset_kv_row_block = (pid_row * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % BLOCK_SIZE_M
-    offset_kv_col_block = (pid_col * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % BLOCK_SIZE_N # check the modulo
+    offset_kv_row_block = (pid_row * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) #% M
+    offset_kv_col_block = (pid_col * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) #% BLOCK_SIZE_N # check the modulo
 
     offset =  pid_b * stride_qb + pid_h * stride_qh + offset_kv_row_block[:,None] * stride_qm + offset_kv_col_block[None,:] *stride_qn
     v_ptr += offset
@@ -384,26 +385,24 @@ def fa_bwd_kernel(q_ptr, k_ptr, v_ptr,
     K_j = tl.load(k_ptr, mask = kv_mask, other = 0)
     V_j = tl.load(v_ptr, mask = kv_mask, other = 0)
 
-    offset_row_block =  tl.arange(0, BLOCK_SIZE_M) % BLOCK_SIZE_M
-    offset_col_block = tl.arange(0, BLOCK_SIZE_N) % BLOCK_SIZE_N # check the modulo
+    offset_row_block =  tl.arange(0, BLOCK_SIZE_M) #% M
+    offset_col_block = tl.arange(0, BLOCK_SIZE_N) #% BLOCK_SIZE_N # check the modulo
 
     q_offset = pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
     q_ptr += q_offset
     o_ptr += q_offset
     dO_ptr += q_offset
     dQ_ptr += q_offset
-    dQ_offset = q_offset
     q_mask  = (offset_row_block[:,None] < M) & (offset_col_block[None, :] < N)
 
     L_ptr += pid_b * stride_lb + pid_h * stride_lh + offset_row_block[:,None] * stride_lm 
     D_ptr += pid_b * stride_lb + pid_h * stride_lh + offset_row_block[:,None] * stride_lm 
     L_mask =(offset_row_block[:,None] < M)  
 
-    dV_j = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype = tl.float32)
-    dK_j = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype = tl.float32)
+    dV_j = tl.zeros((BLOCK_SIZE_M, N), dtype = tl.float32)
+    dK_j = tl.zeros((BLOCK_SIZE_M, N), dtype = tl.float32)
 
     for i in range(0, tl.cdiv(M, BLOCK_SIZE_M)):
-
         
         Q_i = tl.load(q_ptr, mask = q_mask, other = 0) # check mask
         dO_i = tl.load(dO_ptr, mask = q_mask, other = 0) # check mask
@@ -412,17 +411,14 @@ def fa_bwd_kernel(q_ptr, k_ptr, v_ptr,
         D_i = tl.load(D_ptr, mask = L_mask, other = 0) 
 
         # back pass
-        S_i = tl.dot(Q_i, K_j.trans(1,0)) * qk_scale
+        S_i = tl.dot(Q_i, K_j.trans(1,0), input_precision = "ieee") * qk_scale
         P_i = tl.exp(S_i - L_i)
-        # if ((pid_row == 0) and (pid_col == 0)) and (i == 0):
-        #     tl.device_print("S_i - L_i", S_i - L_i)
-        dV_j += tl.dot(P_i.trans(1,0), dO_i)
-        dP_i = tl.dot(dO_i, V_j.trans(1,0))
+        dV_j += tl.dot(P_i.trans(1,0), dO_i, input_precision = "ieee")     
+        dP_i = tl.dot(dO_i, V_j.trans(1,0), input_precision = "ieee")        
         dS_i = P_i * (dP_i - D_i)
-        dQ_i += tl.dot(dS_i, K_j) # write back to HBM
-        dK_j += tl.dot(dS_i.trans(1,0), Q_i)
-
-        tl.store(dQ_ptr + dQ_offset, dQ_i, mask = q_mask)
+        dQ_i += tl.dot(dS_i, K_j, input_precision = "ieee") # write back to HBM
+        tl.store(dQ_ptr, dQ_i, mask = q_mask)
+        dK_j += tl.dot(dS_i.trans(1,0), Q_i, input_precision = "ieee")
 
         q_ptr += BLOCK_SIZE_M * stride_qm
         dO_ptr += BLOCK_SIZE_M * stride_qm
@@ -452,18 +448,18 @@ def fa_bwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
     dK = torch.zeros_like(K, device = 'cuda', dtype = torch.float32)
     dV = torch.zeros_like(V, device = 'cuda', dtype = torch.float32)
 
-    D = O * dO # optimize?
-    D = D.sum(dim = -1).reshape(B, H, M, 1)
+    D = dO * O # optimize?
+    D = D.sum(dim = -1).reshape(B, H, M)
 
-    grid = lambda meta: (B*H, triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(N, meta['BLOCK_SIZE_N']))
-    fa_bwd_kernel[grid](
-                            Q, K, V, 
+    # grid = lambda meta: (B*H, triton.cdiv(M, meta['BLOCK_SIZE_M']), triton.cdiv(N, meta['BLOCK_SIZE_N']))
+    grid = lambda meta: (B*H, triton.cdiv(M, meta['BLOCK_SIZE_M']))
+    fa_bwd_kernel[grid](Q, K, V, 
                             O, dO, L, qk_scale,
                             dQ, dK, dV, D,
                             B, H, M, N,
                             *Q.stride(), 
                             *L.stride(), 
-                            BLOCK_SIZE_M = max(16, triton.next_power_of_2(M)),
+                            BLOCK_SIZE_M = 16, # max(16, triton.next_power_of_2(M)),
                             BLOCK_SIZE_N = max(16, triton.next_power_of_2(N)))   
   
     return dQ, dK, dV
