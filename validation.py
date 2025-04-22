@@ -17,18 +17,13 @@ class TorchOps:
         op = gamma * norm(x) + beta  
         return op
     def flash_attention(self, hq, hk, hv, attn_mask = None):
-        qk_scale = 1 / math.sqrt(hq.shape[-1])
-        O = hq @ hk.transpose(-1, -2) # [batch_size, n_heads, seq_len, seq_len]
-        O = O * qk_scale
-
-        if attn_mask is not None:
-            O = O.masked_fill(attn_mask == 0, float('-inf'))
-
-        # matmul: [batch_size, n_heads, seq_len, seq_len] @  [batch_size, n_heads, seq_len, head_dim]
-        # attn_scores = [batch_size, n_heads, seq_len, head_dim]
-        O  =  torch.softmax(O, dim = -1)  @ hv 
+        qk_scale = 1 / hq.shape[-1]**0.5
+        S = torch.matmul(hq, hk.transpose(2, 3))* qk_scale 
+        # if attn_mask is not None:
+        #     S = S.masked_fill(attn_mask == 0, float('-inf'))
+        P = torch.softmax(S.float(), dim = -1)
+        O  =  torch.matmul(P, hv) 
         return O
-    
 class Validator:
     def __init__(self):
         self.torch_operators = TorchOps()
@@ -123,11 +118,11 @@ class Validator:
             rtol=1e-2
         )              
     def check_flash_attention(self):
-        B, H, M, N = 4, 4, 32, 32
+        B, H, M, N = 4, 4, 64, 64
         self.validate_gradients(
             torch_op= self.torch_operators.flash_attention,
             triton_op= TritonFlashAttnFn.apply,
-            input_shapes=[(B, H, M, N), (B, H, M, N), (B, H, M, N)],  # Shapes for x, weight, bias
+            input_shapes=[(B, H, M, N), (B, H, M, N), (B, H, M, N)],  # Shapes for Q, K, V
             dtype=torch.float32,
             atol=1e-3,
             rtol=1e-2
