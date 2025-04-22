@@ -385,13 +385,14 @@ def fa_bwd_kernel(q_ptr, k_ptr, v_ptr,
     K_j = tl.load(k_ptr, mask = kv_mask, other = 0)
     V_j = tl.load(v_ptr, mask = kv_mask, other = 0)
 
-    offset_row_block = offset_kv_col_block # tl.arange(0, BLOCK_SIZE_M) #% M
-    offset_col_block = offset_kv_col_block #tl.arange(0, BLOCK_SIZE_N) #% BLOCK_SIZE_N # check the modulo
+    offset_row_block =  tl.arange(0, BLOCK_SIZE_M) #% M
+    offset_col_block = tl.arange(0, BLOCK_SIZE_N) #% BLOCK_SIZE_N # check the modulo
 
-    q_ptr += pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
-    o_ptr += pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
-    dO_ptr += pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
-    dQ_ptr += pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
+    q_offset = pid_b * stride_qb + pid_h * stride_qh + offset_row_block[:,None] * stride_qm + offset_col_block[None,:] *stride_qn
+    q_ptr += q_offset
+    o_ptr += q_offset
+    dO_ptr += q_offset
+    dQ_ptr += q_offset
     q_mask  = (offset_row_block[:,None] < M) & (offset_col_block[None, :] < N)
 
     L_ptr += pid_b * stride_lb + pid_h * stride_lh + offset_row_block[:,None] * stride_lm 
@@ -414,9 +415,9 @@ def fa_bwd_kernel(q_ptr, k_ptr, v_ptr,
         dV_j += tl.dot(P_i.trans(1,0), dO_i, input_precision = "ieee")      
         dP_i = tl.dot(dO_i, V_j.trans(1,0), input_precision = "ieee")        
         dS_i = P_i * (dP_i - D_i)
-        dQ_i += tl.dot(dS_i, K_j, input_precision = "ieee") # write back to HBM
-        tl.store(dQ_ptr, dQ_i, mask = q_mask)
-        dK_j += tl.dot(dS_i.trans(1,0), Q_i, input_precision = "ieee")
+        dQ_i += tl.dot(dS_i, K_j, input_precision = "ieee")* qk_scale # write back to HBM
+        tl.atomic_add(dQ_ptr, dQ_i, mask = q_mask)
+        dK_j += tl.dot(dS_i.trans(1,0), Q_i, input_precision = "ieee")* qk_scale
 
         # CHECK THIS
         q_ptr += BLOCK_SIZE_M * stride_qm
@@ -457,7 +458,8 @@ def fa_bwd(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
                         *Q.stride(), 
                         *L.stride(), 
                         BLOCK_SIZE_M = 16,
-                        BLOCK_SIZE_N = max(16,triton.next_power_of_2(N)))   
+                        BLOCK_SIZE_N = max(16,triton.next_power_of_2(N)),
+                        num_stages = 2)   
     return dQ, dK, dV
 
 
